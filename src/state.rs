@@ -190,10 +190,7 @@ impl BarState {
         ret
     }
 
-    pub(crate) fn draw(&mut self, mut force_draw: bool, now: Instant) -> io::Result<()> {
-        // `|= self.is_finished()` should not be needed here, but we used to always draw for
-        // finished progress bars, so it's kept as to not cause compatibility issues in weird cases.
-        force_draw |= self.state.is_finished();
+    pub(crate) fn draw(&mut self, force_draw: bool, now: Instant) -> io::Result<()> {
         let mut drawable = match self.draw_target.drawable(force_draw, now) {
             Some(drawable) => drawable,
             None => return Ok(()),
