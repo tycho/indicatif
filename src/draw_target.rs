@@ -14,6 +14,8 @@ use web_time::Instant;
 use crate::multi::{MultiProgressAlignment, MultiState};
 use crate::TermLike;
 
+const MAX_BURST: u32 = 20;
+
 /// Target for draw operations
 ///
 /// This tells a [`ProgressBar`](crate::ProgressBar) or a
@@ -80,7 +82,7 @@ impl ProgressDrawTarget {
             kind: TargetKind::Term {
                 term,
                 last_line_count: VisualLines::default(),
-                rate_limiter: RateLimiter::new(refresh_rate),
+                rate_limiter: RateLimiter::new(refresh_rate as u32, MAX_BURST),
                 draw_state: DrawState::default(),
             },
         }
@@ -110,7 +112,7 @@ impl ProgressDrawTarget {
             kind: TargetKind::TermLike {
                 inner: term_like,
                 last_line_count: VisualLines::default(),
-                rate_limiter: Option::from(RateLimiter::new(refresh_rate)),
+                rate_limiter: Option::from(RateLimiter::new(refresh_rate as u32, MAX_BURST)),
                 draw_state: DrawState::default(),
             },
         }
@@ -183,7 +185,7 @@ impl ProgressDrawTarget {
                 rate_limiter,
                 draw_state,
             } => {
-                match force_draw || rate_limiter.allow(now) {
+                match rate_limiter.allow(now, force_draw) {
                     true => Some(Drawable::Term {
                         term,
                         last_line_count,
@@ -206,7 +208,7 @@ impl ProgressDrawTarget {
                 last_line_count,
                 rate_limiter,
                 draw_state,
-            } => match force_draw || rate_limiter.as_mut().map_or(true, |r| r.allow(now)) {
+            } => match rate_limiter.as_mut().map_or(true, |r| r.allow(now, force_draw)) {
                 true => Some(Drawable::TermLike {
                     term_like: &**inner,
                     last_line_count,
@@ -437,57 +439,73 @@ impl Drop for DrawStateWrapper<'_> {
     }
 }
 
+const FP_SHIFT: u32 = 32;
+const FP_ONE: u64 = 1u64 << FP_SHIFT;
+
 #[derive(Debug)]
-struct RateLimiter {
-    interval: u16, // in milliseconds
-    capacity: u8,
-    prev: Instant,
+pub struct RateLimiter {
+    interval_ns: u64, // ns per token
+    cap_fp: u64,      // MAX_BURST tokens in Q32
+    tokens_fp: u64,   // current tokens in Q32
+    last: Instant,    // last refill time
 }
 
-/// Rate limit but allow occasional bursts above desired rate
 impl RateLimiter {
-    fn new(rate: u8) -> Self {
+    fn new(rate_hz: u32, max_burst: u32) -> Self {
+        assert!(rate_hz > 0);
+        let interval_ns = 1_000_000_000u64 / rate_hz as u64;
+        let cap_fp = max_burst as u64 * FP_ONE;
         Self {
-            interval: 1000 / (rate as u16), // between 3 and 1000 milliseconds
-            capacity: MAX_BURST,
-            prev: Instant::now(),
+            interval_ns,
+            cap_fp,
+            tokens_fp: cap_fp, // start full burst
+            last: Instant::now(),
         }
     }
 
-    fn allow(&mut self, now: Instant) -> bool {
-        if now < self.prev {
-            return false;
+    #[inline]
+    fn refill(&mut self, now: Instant) {
+        // Instant is monotonic, but guard anyway.
+        if now <= self.last {
+            self.last = now;
+            return;
         }
 
-        let elapsed = now - self.prev;
-        // If `capacity` is 0 and not enough time (`self.interval` ms) has passed since
-        // `self.prev` to add new capacity, return `false`. The goal of this method is to
-        // make this decision as efficient as possible.
-        if self.capacity == 0 && elapsed < Duration::from_millis(self.interval as u64) {
-            return false;
+        let elapsed_ns = (now - self.last).as_nanos() as u64;
+        self.last = now;
+
+        // add_fp = elapsed / interval, in Q32: elapsed_ns * 2^32 / interval_ns
+        let add_fp = elapsed_ns
+            .saturating_mul(FP_ONE)
+            / self.interval_ns.max(1);
+
+        self.tokens_fp = (self.tokens_fp + add_fp).min(self.cap_fp);
+    }
+
+    /// Returns true iff caller should draw *now*.
+    ///
+    /// - If `force == true`: always returns true, and still "spends" a token (can go negative via saturating_sub).
+    /// - If `force == false`: returns true only if at least one token is available.
+    ///
+    /// In both cases, the refill cursor is advanced to `now`, so a forced draw can't be followed immediately by a
+    /// scheduled draw "as if nothing happened".
+    #[inline]
+    fn allow(&mut self, now: Instant, force: bool) -> bool {
+        self.refill(now);
+
+        if force {
+            self.tokens_fp = self.tokens_fp.saturating_sub(FP_ONE);
+            return true;
         }
 
-        // We now calculate `new`, the number of ms, since we last returned `true`,
-        // and `remainder`, which represents a number of ns less than 1ms which we cannot
-        // convert into capacity now, so we're saving it for later.
-        let (new, remainder) = (
-            elapsed.as_millis() / self.interval as u128,
-            elapsed.as_nanos() % (self.interval as u128 * 1_000_000),
-        );
-
-        // We add `new` to `capacity`, subtract one for returning `true` from here,
-        // then make sure it does not exceed a maximum of `MAX_BURST`, then store it.
-        self.capacity = Ord::min(MAX_BURST as u128, (self.capacity as u128) + new - 1) as u8;
-        // Store `prev` for the next iteration after subtracting the `remainder`.
-        // Just use `unwrap` here because it shouldn't be possible for this to underflow.
-        self.prev = now
-            .checked_sub(Duration::from_nanos(remainder as u64))
-            .unwrap();
-        true
+        if self.tokens_fp >= FP_ONE {
+            self.tokens_fp -= FP_ONE;
+            true
+        } else {
+            false
+        }
     }
 }
-
-const MAX_BURST: u8 = 20;
 
 /// The drawn state of an element.
 #[derive(Clone, Debug, Default)]
