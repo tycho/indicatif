@@ -1,4 +1,5 @@
 use std::io;
+use std::backtrace::Backtrace;
 use std::ops::{Add, AddAssign, Sub};
 use std::slice::SliceIndex;
 use std::sync::{Arc, RwLock, RwLockWriteGuard};
@@ -494,6 +495,8 @@ impl RateLimiter {
         self.refill(now);
 
         if force {
+            eprintln!("FORCE draw requested at {}", std::panic::Location::caller());
+            eprintln!("{}", Backtrace::force_capture());
             self.tokens_fp = self.tokens_fp.saturating_sub(FP_ONE);
             return true;
         }
